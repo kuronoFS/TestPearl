@@ -15,9 +15,13 @@ set -E   # Cho phép ERR trap hoạt động bên trong function
 # ----------------------------------------------------------------------------
 # [PHIÊN BẢN SCRIPT] — tăng số này mỗi lần chỉnh sửa code
 # ----------------------------------------------------------------------------
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 SCRIPT_BUILD_DATE="2026-06-12"
 # CHANGELOG:
+#  2.2.0: KẾ HOẠCH B cho lỗi exec "câm" của launcher: tự tìm backend đã giải
+#         nén trong cache và chạy TRỰC TIẾP (LD_LIBRARY_PATH trỏ vào cache để
+#         nạp libssl đi kèm) — bỏ qua hẳn launcher; thêm chẩn đoán strace tự
+#         động (nếu có) để chỉ ra chính xác syscall exec bị lỗi.
 #  2.1.0: rgminer là launcher tự giải nén backend vào cache => xử lý Code=126
 #         "câm": quản lý cache (RGMINER_BUNDLE_CACHE), probe quyền exec, tự xoá
 #         cache hỏng + thử lại; kiểm tra driver cho RTX 50xx (cần >= 595.58.03);
@@ -72,6 +76,9 @@ CPU_LOG="/tmp/rgminer-cpu.log"
 TMP_DIR=""
 CPU_PID=""
 MINER_PID=""
+MINER_EXEC_MODE="launcher"   # launcher = chạy qua rgminer | direct = chạy thẳng backend
+BACKEND_DIR=""
+BACKEND_BIN=""
 
 # ============================================================================
 #  HÀM LOG — mọi dòng đều có timestamp + cấp độ để dễ truy vết
@@ -194,6 +201,30 @@ clean_bundle_cache() {
     fi
     rm -rf "${HOME:-/root}/.cache/rgminer-dual" 2>/dev/null || true
     rm -rf /tmp/rgminer-dual* 2>/dev/null || true
+}
+
+# Tìm backend đã được launcher giải nén sẵn trong cache (cho chế độ DIRECT).
+# Ưu tiên cuda13 trừ khi RGMINER_BACKEND=cuda12. Tìm cả cache cũ ~/.cache.
+locate_backend() {
+    BACKEND_DIR=""
+    BACKEND_BIN=""
+    local names=("rgminer.cuda13" "rgminer.cuda12")
+    if [ "${RGMINER_BACKEND:-}" = "cuda12" ]; then names=("rgminer.cuda12" "rgminer.cuda13"); fi
+    local base n f
+    for base in "$RGMINER_BUNDLE_CACHE" "${HOME:-/root}/.cache/rgminer-dual"; do
+        if [ ! -d "$base" ]; then continue; fi
+        for n in "${names[@]}"; do
+            f=$(find "$base" -maxdepth 2 -type f -name "$n" 2>/dev/null | head -n1)
+            if [ -n "$f" ] && is_elf "$f"; then
+                chmod +x "$f" 2>/dev/null || true
+                BACKEND_BIN="$f"
+                BACKEND_DIR=$(dirname "$f")
+                log_debug "Tìm thấy backend trong cache: $BACKEND_BIN ($(stat -c %s "$f" 2>/dev/null) bytes)"
+                return 0
+            fi
+        done
+    done
+    return 1
 }
 
 # In hiện trạng cache backend — gọi khi gặp Code=126 để biết hỏng chỗ nào
@@ -654,20 +685,58 @@ run_smoke() {
     SMOKE_OUT=$("${SMOKE_RUNNER[@]}" "$BIN_PATH" --list-algos 2>&1) || SMOKE_RC=$?
 }
 
+# Chạy thử backend TRỰC TIẾP — kế hoạch B khi launcher không exec được backend.
+# LD_LIBRARY_PATH trỏ vào thư mục cache để backend nạp libssl.so.1.1 đi kèm.
+run_smoke_direct() {
+    SMOKE_RC=0
+    SMOKE_OUT=$(cd "$BACKEND_DIR" && \
+        LD_LIBRARY_PATH="$BACKEND_DIR${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+        RGMINER_LAUNCHER_DIR="$BACKEND_DIR" \
+        "${SMOKE_RUNNER[@]}" "$BACKEND_BIN" --list-algos 2>&1) || SMOKE_RC=$?
+}
+
 log_info "🔬 Chạy thử binary ($BIN_PATH --list-algos)..."
 run_smoke
 
-# Code=126/127 lần đầu: khả năng cao cache hỏng — dọn rồi thử lại 1 lần
+# Launcher trả 126/127 = không exec được backend. Trên một số máy/container,
+# launcher GIẢI NÉN thành công nhưng cú exec cuối bị chặn (seccomp/AppArmor).
+# => KẾ HOẠCH B: chạy thẳng backend đã giải nén trong cache, bỏ qua launcher.
 if [ "$SMOKE_RC" -eq 126 ] || [ "$SMOKE_RC" -eq 127 ]; then
-    log_warn "Chạy thử thất bại Code=$SMOKE_RC — nghi cache backend hỏng. Hiện trạng cache:"
+    log_warn "Launcher thất bại Code=$SMOKE_RC — kiểm tra backend đã giải nén trong cache:"
     dump_cache_info
-    clean_bundle_cache
-    log_info "Thử lại sau khi dọn cache..."
-    run_smoke
+    if locate_backend; then
+        log_warn "KẾ HOẠCH B: thử chạy TRỰC TIẾP backend (bỏ qua launcher): $BACKEND_BIN"
+        run_smoke_direct
+        if [ "$SMOKE_RC" -eq 0 ]; then
+            MINER_EXEC_MODE="direct"
+            log_info "✅ Backend chạy trực tiếp OK — chuyển sang chế độ DIRECT (không dùng launcher nữa)."
+        else
+            log_warn "Backend trực tiếp cũng thất bại (Code=$SMOKE_RC). Output: $(echo "$SMOKE_OUT" | head -2 | tr '\n' ' ')"
+        fi
+    else
+        log_warn "Cache chưa có backend hợp lệ để chạy trực tiếp."
+    fi
+    if [ "$MINER_EXEC_MODE" = "launcher" ]; then
+        clean_bundle_cache
+        log_info "Dọn cache xong — thử lại launcher (lần 2, launcher sẽ giải nén lại từ đầu)..."
+        run_smoke
+        if { [ "$SMOKE_RC" -eq 126 ] || [ "$SMOKE_RC" -eq 127 ]; } && locate_backend; then
+            log_warn "Launcher vẫn lỗi nhưng đã giải nén backend mới — thử DIRECT với backend mới..."
+            run_smoke_direct
+            if [ "$SMOKE_RC" -eq 0 ]; then
+                MINER_EXEC_MODE="direct"
+                log_info "✅ Backend (mới giải nén) chạy trực tiếp OK — chuyển sang chế độ DIRECT."
+            fi
+        fi
+    fi
 fi
 
 if [ "$SMOKE_RC" -eq 0 ]; then
-    log_info "✅ Binary + backend chạy được. Thuật toán hỗ trợ:"
+    if [ "$MINER_EXEC_MODE" = "direct" ]; then
+        log_info "✅ Sẵn sàng đào ở chế độ DIRECT: $BACKEND_BIN"
+    else
+        log_info "✅ Binary + backend chạy được qua launcher."
+    fi
     echo "$SMOKE_OUT" | head -8 | while IFS= read -r line; do log_debug "   | $line"; done
 elif [ "$SMOKE_RC" -eq 124 ]; then
     log_warn "Chạy thử bị timeout sau 30s (bất thường nhưng không chặn) — tiếp tục."
@@ -678,18 +747,33 @@ elif [ "$SMOKE_RC" -eq 126 ] || [ "$SMOKE_RC" -eq 127 ] || [ "$SMOKE_RC" -eq 132
     if [ -n "$SMOKE_OUT" ]; then
         log_error "Chạy thử thất bại (Code=$SMOKE_RC). Output: $(echo "$SMOKE_OUT" | head -3)"
     else
-        log_error "Chạy thử thất bại (Code=$SMOKE_RC) — KHÔNG có output (launcher thoát câm: đặc trưng lỗi exec backend từ cache)."
+        log_error "Chạy thử thất bại (Code=$SMOKE_RC) — KHÔNG có output (launcher thoát câm: lỗi exec backend)."
     fi
     explain_exit_code "$SMOKE_RC"
     dump_file_info "$BIN_PATH"
     dump_cache_info
-    # Thử ép từng backend để khoanh vùng lỗi
+    # strace (nếu có) sẽ chỉ ra CHÍNH XÁC syscall exec nào lỗi và errno gì
+    if command -v strace >/dev/null 2>&1; then
+        STRACE_LOG="/tmp/rgminer-strace.log"
+        log_warn "Chạy strace để tìm syscall exec bị lỗi (log đầy đủ: $STRACE_LOG)..."
+        "${SMOKE_RUNNER[@]}" strace -f -qq -s 160 -e trace=execve,execveat -o "$STRACE_LOG" "$BIN_PATH" --list-algos >/dev/null 2>&1 || true
+        if [ -s "$STRACE_LOG" ]; then
+            log_error "Các dòng exec cuối cùng (errno ở cuối dòng = lý do chính xác):"
+            grep -E "execve|execveat" "$STRACE_LOG" 2>/dev/null | tail -6 | while IFS= read -r line; do log_error "   | $line"; done
+        else
+            log_warn "strace không thu được dữ liệu (container có thể chặn ptrace)."
+        fi
+    else
+        log_warn "Mẹo: cài strace (apt-get update && apt-get install -y strace) rồi chạy lại —"
+        log_warn "  script sẽ tự dùng strace để chỉ ra chính xác syscall exec bị chặn và errno."
+    fi
+    # Thử ép từng backend qua launcher để khoanh vùng lỗi
     for try_backend in cuda13 cuda12; do
         TRY_RC=0
         TRY_OUT=$(RGMINER_BACKEND="$try_backend" "${SMOKE_RUNNER[@]}" "$BIN_PATH" --list-algos 2>&1) || TRY_RC=$?
         log_error "  Thử ép RGMINER_BACKEND=$try_backend => Code=$TRY_RC $(echo "$TRY_OUT" | head -1)"
     done
-    die "Binary không thể chạy trên máy này. Gợi ý: thử RGMINER_BUNDLE_CACHE=/duong/dan/khac, FORCE_REINSTALL=1; kiểm tra noexec/seccomp của container."
+    die "Cả launcher lẫn backend trực tiếp đều không chạy được. Gợi ý: xem errno trong strace ở trên; thử RGMINER_BUNDLE_CACHE=/duong/dan/khac; chạy container không kèm seccomp/AppArmor tuỳ chỉnh (--security-opt seccomp=unconfined) hoặc đổi host."
 else
     log_warn "Chạy thử trả về Code=$SMOKE_RC (không chặn). Output đầu:"
     echo "$SMOKE_OUT" | head -5 | while IFS= read -r line; do log_warn "   | $line"; done
@@ -727,11 +811,22 @@ if [ -n "$EXTRA_ARGS" ]; then read -r -a EXTRA_ARR <<< "$EXTRA_ARGS" || true; fi
 
 launch_miner() {
     local wname=$1
-    local cmd=("$BIN_PATH" --algo "$ALGO" --stratum "$POOL" --wallet "$WALLET" --worker-name "$wname")
+    local bin="$BIN_PATH"
+    if [ "$MINER_EXEC_MODE" = "direct" ]; then bin="$BACKEND_BIN"; fi
+    local cmd=("$bin" --algo "$ALGO" --stratum "$POOL" --wallet "$WALLET" --worker-name "$wname")
     if [ ${#EXTRA_ARR[@]} -gt 0 ]; then cmd+=("${EXTRA_ARR[@]}"); fi
-    log_info "🚀 Lệnh chạy: ${RGMINER_BACKEND:+RGMINER_BACKEND=$RGMINER_BACKEND }${cmd[*]}"
-    log_debug "Cache backend: ${RGMINER_BUNDLE_CACHE:-($HOME/.cache/rgminer-dual mặc định)}"
-    "${cmd[@]}"
+    if [ "$MINER_EXEC_MODE" = "direct" ]; then
+        log_info "🚀 Lệnh chạy (DIRECT — bỏ qua launcher): ${cmd[*]}"
+        # launch_miner luôn được gọi trong subshell nền nên cd ở đây an toàn
+        cd "$BACKEND_DIR" 2>/dev/null || true
+        LD_LIBRARY_PATH="$BACKEND_DIR${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+        RGMINER_LAUNCHER_DIR="$BACKEND_DIR" \
+            "${cmd[@]}"
+    else
+        log_info "🚀 Lệnh chạy: ${RGMINER_BACKEND:+RGMINER_BACKEND=$RGMINER_BACKEND }${cmd[*]}"
+        log_debug "Cache backend: $RGMINER_BUNDLE_CACHE"
+        "${cmd[@]}"
+    fi
 }
 
 # Chạy miner ở tiến trình nền rồi 'wait' — nhờ vậy script nhận được SIGTERM
@@ -756,10 +851,20 @@ while :; do
     fi
 
     hr
-    log_info "▶️  Lần chạy #$ATTEMPT (script v$SCRIPT_VERSION, $(date '+%H:%M:%S'))"
+    log_info "▶️  Lần chạy #$ATTEMPT (script v$SCRIPT_VERSION, chế độ exec: $MINER_EXEC_MODE, $(date '+%H:%M:%S'))"
     if [ ! -x "$BIN_PATH" ]; then
         dump_file_info "$BIN_PATH"
         die "Binary $BIN_PATH biến mất hoặc mất quyền thực thi giữa chừng!"
+    fi
+    # Chế độ DIRECT: nếu backend trong cache biến mất, chạy launcher 1 lần để
+    # nó giải nén lại (kể cả khi exec của launcher lỗi, phần giải nén vẫn chạy)
+    if [ "$MINER_EXEC_MODE" = "direct" ] && [ ! -x "$BACKEND_BIN" ]; then
+        log_warn "Backend DIRECT biến mất ($BACKEND_BIN) — chạy launcher để giải nén lại..."
+        run_smoke
+        if ! locate_backend; then
+            die "Không khôi phục được backend trong cache — chạy lại script từ đầu."
+        fi
+        log_info "Đã khôi phục backend: $BACKEND_BIN"
     fi
 
     START_TS=$(date +%s)
@@ -793,14 +898,17 @@ while :; do
     explain_exit_code "$EXIT_CODE"
 
     # Crash ngay khi vừa chạy (126/127) => chẩn đoán sâu ngay + tự dọn cache
-    # backend để lần restart sau launcher giải nén lại sạch sẽ (tự phục hồi)
+    # backend để lần restart sau launcher giải nén lại sạch sẽ (tự phục hồi).
+    # Ở chế độ DIRECT thì KHÔNG dọn cache (sẽ xoá mất chính backend đang dùng).
     if [ "$EXIT_CODE" -eq 126 ] || [ "$EXIT_CODE" -eq 127 ]; then
         if [ "$DEEP_DIAG_DONE" -eq 0 ]; then
             dump_file_info "$BIN_PATH"
             dump_cache_info
             DEEP_DIAG_DONE=1
         fi
-        clean_bundle_cache
+        if [ "$MINER_EXEC_MODE" = "launcher" ]; then
+            clean_bundle_cache
+        fi
     fi
 
     DELAY=$RESTART_DELAY
