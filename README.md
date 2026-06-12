@@ -1,19 +1,18 @@
 # Pearl (PRL) Modular Mining Script
 
-Script đào Pearl (PRL) dạng modular — dễ cấu hình, hỗ trợ GPU, CPU, hoặc cả hai đồng thời.
+Script đào Pearl (PRL) all-in-one — dễ cấu hình, hỗ trợ GPU, CPU, hoặc cả hai đồng thời.
 
 ## Cấu trúc
 
 ```
-├── config.env   ← Cấu hình tập trung (chỉnh sửa file này)
-├── run.sh       ← Script chính (không cần sửa)
+├── run.sh       ← Script chính (cấu hình ở đầu file)
 └── README.md    ← Tài liệu hướng dẫn
 ```
 
 ## Bắt đầu nhanh
 
 ### 1. Cấu hình
-Mở `config.env` và chỉnh sửa các tham số:
+Mở `run.sh` và chỉnh sửa phần **⚙️ CẤU HÌNH** ở đầu file:
 
 ```bash
 # Chọn chế độ đào
@@ -41,7 +40,7 @@ sudo ./run.sh
 | `cpu`  | Chỉ đào bằng CPU | bzminer (beta) |
 | `dual` | Đào đồng thời GPU + CPU | rgminer + bzminer |
 
-## Cấu hình chi tiết (`config.env`)
+## Cấu hình chi tiết (trong `run.sh`)
 
 ### GPU (rgminer)
 | Tham số | Mô tả | Mặc định |

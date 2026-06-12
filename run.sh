@@ -1,8 +1,8 @@
 #!/bin/bash
 ###############################################################################
-#  Pearl (PRL) Modular Mining Script
+#  Pearl (PRL) Modular Mining Script — All-in-One
 #  Hỗ trợ: GPU (rgminer) | CPU (bzminer) | Dual (GPU + CPU đồng thời)
-#  Cấu hình: chỉnh sửa file  config.env  — không cần sửa script này.
+#  Cấu hình: chỉnh sửa phần "CẤU HÌNH" bên dưới.
 ###############################################################################
 
 set -euo pipefail
@@ -10,14 +10,53 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${SCRIPT_DIR}/miners"
 
-# ─── Load cấu hình ──────────────────────────────────────────────────────────
-CONFIG_FILE="${SCRIPT_DIR}/config.env"
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "❌  Không tìm thấy config.env tại: $CONFIG_FILE"
-    exit 1
-fi
-# shellcheck source=config.env
-source "$CONFIG_FILE"
+###############################################################################
+#                         ⚙️  CẤU HÌNH — CHỈNH SỬA TẠI ĐÂY
+###############################################################################
+
+# ─── Chế độ đào (MINING_MODE) ───────────────────────────────────────────────
+#   "gpu"      — Chỉ đào bằng GPU  (rgminer, NVIDIA CUDA)
+#   "cpu"      — Chỉ đào bằng CPU  (bzminer beta)
+#   "dual"     — Đào đồng thời cả GPU + CPU
+MINING_MODE="gpu"
+
+# ─── Ví và Worker ────────────────────────────────────────────────────────────
+WALLET="prl1p6l40ns5k4afu7whgzgmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4"
+WORKER_NAME="rig01"
+
+# ─── Cấu hình GPU (rgminer) ─────────────────────────────────────────────────
+GPU_ALGO="pearl"
+GPU_POOL="asia.rplant.xyz:17168"
+
+# Batch size cho Pearl (tăng nếu GPU có VRAM lớn, ví dụ RTX 5090 → 256)
+# Để trống "" để dùng mặc định của rgminer
+GPU_PEARL_BATCH=""
+
+# Link tải dự phòng nếu GitHub API không phản hồi
+GPU_MINER_FALLBACK_URL="https://github.com/Printscan/rgminer/releases/download/v0.9.4/rgminer-0.9.4.tar.gz"
+
+# ─── Cấu hình CPU (bzminer) ─────────────────────────────────────────────────
+CPU_ALGO="pearl"
+CPU_POOL="stratum+tcp://pearl-asia1.luckypool.io:3360"
+
+# Số luồng CPU (đặt = số lõi vật lý, KHÔNG phải logical/HT)
+# Để "auto" để script tự phát hiện
+CPU_THREADS="auto"
+CPU_THREADS_CACHE_GROUP="3"
+
+# Link tải bzminer dự phòng
+CPU_MINER_FALLBACK_URL="https://github.com/bzminer/bzminer/releases/download/v25.0.0b2/bzminer_v25.0.0b2_linux.tar.gz"
+
+# ─── Khởi động lại khi crash ────────────────────────────────────────────────
+# Thời gian chờ (giây) trước khi tự động khởi động lại miner bị crash
+RESTART_DELAY=5
+
+# Số lần thử lại liên tiếp tối đa trước khi dừng (0 = vô hạn)
+MAX_RETRIES=0
+
+###############################################################################
+#                    🔒  KHÔNG CẦN CHỈNH SỬA BÊN DƯỚI ĐÂY
+###############################################################################
 
 # ─── Hàm tiện ích ───────────────────────────────────────────────────────────
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
