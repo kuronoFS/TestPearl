@@ -15,8 +15,14 @@ set -E   # Cho phép ERR trap hoạt động bên trong function
 # ----------------------------------------------------------------------------
 # [PHIÊN BẢN SCRIPT] — tăng số này mỗi lần chỉnh sửa code
 # ----------------------------------------------------------------------------
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_BUILD_DATE="2026-06-12"
+# CHANGELOG:
+#  2.1.0: rgminer là launcher tự giải nén backend vào cache => xử lý Code=126
+#         "câm": quản lý cache (RGMINER_BUNDLE_CACHE), probe quyền exec, tự xoá
+#         cache hỏng + thử lại; kiểm tra driver cho RTX 50xx (cần >= 595.58.03);
+#         tự chọn RGMINER_BACKEND (cuda12/cuda13) như h-run.sh chính chủ.
+#  2.0.0: viết lại toàn bộ: log 7 bước, kiểm định binary, chẩn đoán exit code.
 
 # ----------------------------------------------------------------------------
 # [CẤU HÌNH ĐÀO]
@@ -36,6 +42,12 @@ RGMINER_VERSION="${RGMINER_VERSION:-latest}"   # "latest" hoặc tag cụ thể,
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 FORCE_REINSTALL="${FORCE_REINSTALL:-0}"        # 1 = xoá binary cũ và tải lại từ đầu
 EXPECTED_SHA256="${EXPECTED_SHA256:-}"         # Để trống = không so khớp checksum
+
+# rgminer là LAUNCHER: lúc chạy nó tự giải nén backend (rgminer.cuda12/cuda13)
+# vào thư mục cache rồi exec. Cache hỏng / bị chặn exec => Code=126 không log.
+RGMINER_BACKEND="${RGMINER_BACKEND:-}"         # trống = tự chọn | cuda12 | cuda13 | auto
+RGMINER_BUNDLE_CACHE="${RGMINER_BUNDLE_CACHE:-/usr/local/lib/rgminer-cache}"
+MIN_CUDA13_DRIVER="595.58.03"                  # driver tối thiểu cho backend CUDA 13 (RTX 50xx)
 
 if [ "$RGMINER_VERSION" = "latest" ]; then
     URL_DEFAULT="https://github.com/Printscan/rgminer/releases/latest/download/rgminer"
@@ -130,6 +142,81 @@ elf_arch_of() {
 
 sha256_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 
+# So sánh version dạng a.b.c — version_ge A B nghĩa là A >= B
+version_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }
+
+# ----------------------------------------------------------------------------
+# CACHE BACKEND: binary rgminer là launcher tự giải nén rgminer.cuda12/cuda13
+# vào cache (RGMINER_BUNDLE_CACHE > XDG_CACHE_HOME > ~/.cache/rgminer-dual >
+# /tmp) rồi exec. Nếu cache bị hỏng (giải nén dở dang do bị kill) hoặc thư mục
+# bị mount noexec thì launcher thoát Code=126 mà KHÔNG in lỗi nào.
+# ----------------------------------------------------------------------------
+
+# Kiểm tra 1 thư mục có cho phép GHI + THỰC THI file không (bắt noexec)
+exec_probe() {
+    local d=$1 probe="" src=""
+    probe="$d/.exec_probe.$$"
+    for src in /bin/true /usr/bin/true; do
+        if [ -x "$src" ]; then break; fi
+    done
+    if [ ! -x "$src" ]; then return 0; fi   # không có 'true' để thử => bỏ qua probe
+    cp "$src" "$probe" 2>/dev/null || return 1
+    chmod +x "$probe" 2>/dev/null || true
+    if "$probe" 2>/dev/null; then
+        rm -f "$probe" 2>/dev/null || true
+        return 0
+    fi
+    rm -f "$probe" 2>/dev/null || true
+    return 1
+}
+
+# Chọn thư mục cache đầu tiên cho phép ghi + exec, rồi export cho launcher
+prepare_bundle_cache() {
+    local d
+    for d in "$RGMINER_BUNDLE_CACHE" "${HOME:-/root}/.cache/rgminer-dual" "/var/tmp/rgminer-cache" "/tmp/rgminer-cache"; do
+        if [ -z "$d" ]; then continue; fi
+        if mkdir -p "$d" 2>/dev/null && [ -w "$d" ] && exec_probe "$d"; then
+            RGMINER_BUNDLE_CACHE="$d"
+            export RGMINER_BUNDLE_CACHE
+            log_info "Cache backend : $RGMINER_BUNDLE_CACHE (đã kiểm tra: ghi + thực thi OK)"
+            return 0
+        fi
+        log_warn "Thư mục cache '$d' không ghi/exec được (noexec?) — thử vị trí khác..."
+    done
+    die "Không tìm được thư mục nào cho phép GHI + THỰC THI để launcher giải nén backend rgminer!"
+}
+
+# Xoá sạch payload đã giải nén (kể cả cache mặc định cũ) để launcher làm lại từ đầu
+clean_bundle_cache() {
+    if [ -n "$RGMINER_BUNDLE_CACHE" ] && [ -d "$RGMINER_BUNDLE_CACHE" ]; then
+        log_info "🧹 Dọn cache backend: $RGMINER_BUNDLE_CACHE (launcher sẽ tự giải nén lại sạch sẽ)"
+        rm -rf "${RGMINER_BUNDLE_CACHE:?}"/* "${RGMINER_BUNDLE_CACHE:?}"/.[!.]* 2>/dev/null || true
+    fi
+    rm -rf "${HOME:-/root}/.cache/rgminer-dual" 2>/dev/null || true
+    rm -rf /tmp/rgminer-dual* 2>/dev/null || true
+}
+
+# In hiện trạng cache backend — gọi khi gặp Code=126 để biết hỏng chỗ nào
+dump_cache_info() {
+    hr
+    log_warn "CHẨN ĐOÁN CACHE BACKEND (RGMINER_BUNDLE_CACHE=$RGMINER_BUNDLE_CACHE):"
+    if [ -d "$RGMINER_BUNDLE_CACHE" ]; then
+        while IFS= read -r f; do
+            log_warn "   | $(ls -ld "$f" 2>/dev/null)"
+        done < <(find "$RGMINER_BUNDLE_CACHE" -maxdepth 2 2>/dev/null | head -15)
+        while IFS= read -r f; do
+            if is_elf "$f"; then
+                log_warn "   -> $(basename "$f"): $(stat -c %s "$f" 2>/dev/null) bytes — ELF hợp lệ"
+            else
+                log_warn "   -> $(basename "$f"): $(stat -c %s "$f" 2>/dev/null) bytes — HỎNG (không phải ELF — giải nén dở dang?)"
+            fi
+        done < <(find "$RGMINER_BUNDLE_CACHE" -maxdepth 2 -name 'rgminer.cuda*' -type f 2>/dev/null)
+    else
+        log_warn "   (thư mục cache chưa tồn tại — launcher sẽ tự tạo khi chạy)"
+    fi
+    hr
+}
+
 # In toàn bộ thông tin về 1 file để biết chính xác nó là gì / hỏng chỗ nào
 dump_file_info() {
     local p=$1
@@ -188,10 +275,12 @@ explain_exit_code() {
         0)   log_warn "Code=0: miner tự thoát bình thường (bất thường với miner — có thể bị pool ngắt kết nối)." ;;
         1)   log_error "Code=1: lỗi chung — thường do sai tham số, sai wallet/pool, hoặc pool từ chối. Đọc log miner ngay phía trên." ;;
         2)   log_error "Code=2: sai cú pháp tham số dòng lệnh." ;;
+        42)  log_error "Code=42: watchdog của rgminer phát hiện GPU CUDA failure (GPU treo/rớt khỏi bus) — kiểm tra driver, nhiệt độ, nguồn điện." ;;
         126) log_error "Code=126: file TỒN TẠI nhưng KHÔNG THỂ THỰC THI."
-             log_error "  Nguyên nhân thường gặp: file không phải binary Linux ELF (tải nhầm/hỏng),"
-             log_error "  file là thư mục, thiếu quyền +x, hoặc phân vùng mount noexec."
-             log_error "  => Cách sửa nhanh: chạy lại với FORCE_REINSTALL=1 để tải lại binary sạch." ;;
+             log_error "  Với rgminer: đây thường là LAUNCHER không exec được backend (rgminer.cuda12/13)"
+             log_error "  đã giải nén vào cache — do cache hỏng (bị kill giữa chừng) hoặc thư mục noexec."
+             log_error "  Script sẽ tự dọn cache và thử lại; nếu vẫn lỗi: thử FORCE_REINSTALL=1,"
+             log_error "  hoặc đổi chỗ cache: RGMINER_BUNDLE_CACHE=/duong/dan/khac" ;;
         127) log_error "Code=127: không tìm thấy file, hoặc thiếu dynamic loader/thư viện hệ thống (glibc quá cũ?)." ;;
         130) log_warn  "Code=130: bị dừng bởi Ctrl+C (SIGINT)." ;;
         132) log_error "Code=132 (SIGILL): CPU không hỗ trợ tập lệnh binary cần — sai kiến trúc hoặc CPU quá cũ." ;;
@@ -275,6 +364,7 @@ log_info "EXTRA_ARGS    : ${EXTRA_ARGS:-(không có)}"
 log_info "RGMINER_VER   : $RGMINER_VERSION"
 log_debug "URL_DOWNLOAD  : $URL_DOWNLOAD"
 log_debug "BIN_PATH      : $BIN_PATH"
+log_debug "BACKEND       : ${RGMINER_BACKEND:-(auto)} | CACHE: $RGMINER_BUNDLE_CACHE"
 log_debug "DEBUG=$DEBUG FORCE_REINSTALL=$FORCE_REINSTALL RESTART_DELAY=${RESTART_DELAY}s MAX_RETRIES=$MAX_RETRIES MIN_UPTIME=${MIN_UPTIME}s"
 
 if [ -z "$WALLET" ]; then
@@ -353,11 +443,56 @@ else
         GPU_COUNT=$(echo "$GPU_INFO" | wc -l)
         log_info "✅ Phát hiện $GPU_COUNT GPU:"
         echo "$GPU_INFO" | while IFS= read -r line; do log_info "   -> $line"; done
-        log_debug "rgminer yêu cầu: NVIDIA RTX 20xx trở lên, driver hỗ trợ CUDA 12+"
+
+        # --- Phân loại backend CUDA theo compute capability + driver ---
+        # (logic giống h-run.sh chính chủ: cap >= 12.x tức RTX 50xx/Blackwell
+        #  bắt buộc backend CUDA 13, mà CUDA 13 đòi driver >= MIN_CUDA13_DRIVER)
+        DRIVER_VER=$(echo "$GPU_INFO" | head -n1 | awk -F',' '{print $2}' | tr -d ' ')
+        GPU_CAPS=$(timeout 15 nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null) || true
+        MAX_CAP_MAJOR=0
+        if [ -n "${GPU_CAPS:-}" ]; then
+            while IFS= read -r cap_line; do
+                cap=$(echo "$cap_line" | awk -F',' '{print $NF}' | tr -d ' ')
+                cap_major=${cap%%.*}
+                case "$cap_major" in ''|*[!0-9]*) continue ;; esac
+                log_debug "Compute capability: $cap_line (sm_${cap/./})"
+                if [ "$cap_major" -gt "$MAX_CAP_MAJOR" ]; then MAX_CAP_MAJOR=$cap_major; fi
+            done <<< "$GPU_CAPS"
+        fi
+
+        SUGGESTED_BACKEND=""
+        if [ "$MAX_CAP_MAJOR" -ge 12 ]; then
+            log_info "GPU thế hệ Blackwell/RTX 50xx (compute cap ${MAX_CAP_MAJOR}.x) — BẮT BUỘC backend CUDA 13."
+            SUGGESTED_BACKEND="cuda13"
+            if [ -n "$DRIVER_VER" ] && version_ge "$DRIVER_VER" "$MIN_CUDA13_DRIVER"; then
+                log_info "✅ Driver $DRIVER_VER >= $MIN_CUDA13_DRIVER — đủ điều kiện chạy backend CUDA 13."
+            else
+                log_error "Driver hiện tại: ${DRIVER_VER:-?} — backend CUDA 13 của rgminer yêu cầu >= $MIN_CUDA13_DRIVER."
+                log_error "  Backend CUDA 12 thì KHÔNG hỗ trợ RTX 50xx (chỉ tới sm_90 = RTX 40xx),"
+                log_error "  nên rgminer gần như chắc chắn KHÔNG đào được cho tới khi nâng driver."
+                log_error "  => Cách sửa: nâng driver NVIDIA >= 595.58.03 TRÊN MÁY HOST (driver là của host,"
+                log_error "     không cài được từ trong container). Nếu thuê máy (vast.ai/runpod...),"
+                log_error "     hãy chọn host có driver mới hơn hoặc yêu cầu nhà cung cấp nâng cấp."
+            fi
+        elif [ "$MAX_CAP_MAJOR" -gt 0 ]; then
+            log_debug "Compute cap tối đa: ${MAX_CAP_MAJOR}.x — backend CUDA 12/13 đều dùng được, để launcher tự chọn."
+        fi
+
+        if [ -z "$RGMINER_BACKEND" ] && [ -n "$SUGGESTED_BACKEND" ]; then
+            RGMINER_BACKEND="$SUGGESTED_BACKEND"
+            log_info "Tự chọn RGMINER_BACKEND=$RGMINER_BACKEND theo GPU/driver (giống h-run.sh chính chủ)."
+        fi
     else
         log_warn "nvidia-smi có nhưng chạy lỗi: $GPU_INFO"
         log_warn "  => Driver chưa được nạp vào container? Kiểm tra lại '--gpus all'."
     fi
+fi
+
+if [ -n "$RGMINER_BACKEND" ]; then
+    export RGMINER_BACKEND
+    log_info "Backend rgminer: RGMINER_BACKEND=$RGMINER_BACKEND (đã export cho miner)"
+else
+    log_debug "RGMINER_BACKEND để trống — launcher của rgminer sẽ tự chọn (auto)."
 fi
 
 # ============================================================================
@@ -506,25 +641,55 @@ else
     install_miner
 fi
 
-# Chạy thử nhẹ (smoke test) để chắc chắn binary thực thi được trên máy này
-log_info "🔬 Chạy thử binary ($BIN_PATH --list-algos)..."
+# Chuẩn bị cache cho launcher (rgminer tự giải nén backend vào đây khi chạy)
+prepare_bundle_cache
+clean_bundle_cache   # dọn payload hỏng từ các lần chạy trước — nguyên nhân Code=126 "câm" phổ biến
+
+# Chạy thử nhẹ (smoke test) để chắc chắn binary + backend thực thi được trên máy này
 SMOKE_RUNNER=()
-command -v timeout >/dev/null 2>&1 && SMOKE_RUNNER=(timeout 20)
-SMOKE_RC=0
-SMOKE_OUT=$("${SMOKE_RUNNER[@]}" "$BIN_PATH" --list-algos 2>&1) || SMOKE_RC=$?
+if command -v timeout >/dev/null 2>&1; then SMOKE_RUNNER=(timeout 30); fi
+
+run_smoke() {
+    SMOKE_RC=0
+    SMOKE_OUT=$("${SMOKE_RUNNER[@]}" "$BIN_PATH" --list-algos 2>&1) || SMOKE_RC=$?
+}
+
+log_info "🔬 Chạy thử binary ($BIN_PATH --list-algos)..."
+run_smoke
+
+# Code=126/127 lần đầu: khả năng cao cache hỏng — dọn rồi thử lại 1 lần
+if [ "$SMOKE_RC" -eq 126 ] || [ "$SMOKE_RC" -eq 127 ]; then
+    log_warn "Chạy thử thất bại Code=$SMOKE_RC — nghi cache backend hỏng. Hiện trạng cache:"
+    dump_cache_info
+    clean_bundle_cache
+    log_info "Thử lại sau khi dọn cache..."
+    run_smoke
+fi
+
 if [ "$SMOKE_RC" -eq 0 ]; then
-    log_info "✅ Binary chạy được. Thuật toán hỗ trợ:"
+    log_info "✅ Binary + backend chạy được. Thuật toán hỗ trợ:"
     echo "$SMOKE_OUT" | head -8 | while IFS= read -r line; do log_debug "   | $line"; done
 elif [ "$SMOKE_RC" -eq 124 ]; then
-    log_warn "Chạy thử bị timeout sau 20s (bất thường nhưng không chặn) — tiếp tục."
+    log_warn "Chạy thử bị timeout sau 30s (bất thường nhưng không chặn) — tiếp tục."
 elif echo "$SMOKE_OUT" | grep -qi "GLIBC"; then
     log_error "Output: $(echo "$SMOKE_OUT" | head -3)"
     die "Thiếu GLIBC — image/OS quá cũ so với binary. Dùng Ubuntu 22.04/24.04 (vd image nvidia/cuda:12.x-base-ubuntu22.04)."
 elif [ "$SMOKE_RC" -eq 126 ] || [ "$SMOKE_RC" -eq 127 ] || [ "$SMOKE_RC" -eq 132 ] || [ "$SMOKE_RC" -eq 139 ]; then
-    log_error "Chạy thử thất bại (Code=$SMOKE_RC). Output: $(echo "$SMOKE_OUT" | head -3)"
+    if [ -n "$SMOKE_OUT" ]; then
+        log_error "Chạy thử thất bại (Code=$SMOKE_RC). Output: $(echo "$SMOKE_OUT" | head -3)"
+    else
+        log_error "Chạy thử thất bại (Code=$SMOKE_RC) — KHÔNG có output (launcher thoát câm: đặc trưng lỗi exec backend từ cache)."
+    fi
     explain_exit_code "$SMOKE_RC"
     dump_file_info "$BIN_PATH"
-    die "Binary không thể chạy trên máy này — xem chẩn đoán phía trên."
+    dump_cache_info
+    # Thử ép từng backend để khoanh vùng lỗi
+    for try_backend in cuda13 cuda12; do
+        TRY_RC=0
+        TRY_OUT=$(RGMINER_BACKEND="$try_backend" "${SMOKE_RUNNER[@]}" "$BIN_PATH" --list-algos 2>&1) || TRY_RC=$?
+        log_error "  Thử ép RGMINER_BACKEND=$try_backend => Code=$TRY_RC $(echo "$TRY_OUT" | head -1)"
+    done
+    die "Binary không thể chạy trên máy này. Gợi ý: thử RGMINER_BUNDLE_CACHE=/duong/dan/khac, FORCE_REINSTALL=1; kiểm tra noexec/seccomp của container."
 else
     log_warn "Chạy thử trả về Code=$SMOKE_RC (không chặn). Output đầu:"
     echo "$SMOKE_OUT" | head -5 | while IFS= read -r line; do log_warn "   | $line"; done
@@ -564,7 +729,8 @@ launch_miner() {
     local wname=$1
     local cmd=("$BIN_PATH" --algo "$ALGO" --stratum "$POOL" --wallet "$WALLET" --worker-name "$wname")
     if [ ${#EXTRA_ARR[@]} -gt 0 ]; then cmd+=("${EXTRA_ARR[@]}"); fi
-    log_info "🚀 Lệnh chạy: ${cmd[*]}"
+    log_info "🚀 Lệnh chạy: ${RGMINER_BACKEND:+RGMINER_BACKEND=$RGMINER_BACKEND }${cmd[*]}"
+    log_debug "Cache backend: ${RGMINER_BUNDLE_CACHE:-($HOME/.cache/rgminer-dual mặc định)}"
     "${cmd[@]}"
 }
 
@@ -626,10 +792,15 @@ while :; do
     log_warn "⚠️  Miner thoát: Code=$EXIT_CODE sau khi chạy được ${DURATION}s (lần #$ATTEMPT)"
     explain_exit_code "$EXIT_CODE"
 
-    # Crash ngay khi vừa chạy (126/127) => chẩn đoán sâu ngay, không đợi
-    if { [ "$EXIT_CODE" -eq 126 ] || [ "$EXIT_CODE" -eq 127 ]; } && [ "$DEEP_DIAG_DONE" -eq 0 ]; then
-        dump_file_info "$BIN_PATH"
-        DEEP_DIAG_DONE=1
+    # Crash ngay khi vừa chạy (126/127) => chẩn đoán sâu ngay + tự dọn cache
+    # backend để lần restart sau launcher giải nén lại sạch sẽ (tự phục hồi)
+    if [ "$EXIT_CODE" -eq 126 ] || [ "$EXIT_CODE" -eq 127 ]; then
+        if [ "$DEEP_DIAG_DONE" -eq 0 ]; then
+            dump_file_info "$BIN_PATH"
+            dump_cache_info
+            DEEP_DIAG_DONE=1
+        fi
+        clean_bundle_cache
     fi
 
     DELAY=$RESTART_DELAY
