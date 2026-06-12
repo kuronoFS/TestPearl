@@ -8,7 +8,7 @@ set -u
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 
 # --- Các biến cấu hình gốc của bạn ---
-MINING_MODE="DUAL" # Tùy chọn: CPU | GPU | DUAL
+MINING_MODE="GPU" # Tùy chọn: CPU | GPU | DUAL
 WALLET="prllp6l40ns5k4afu7whzgzmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4"
 WORKER="rig01"
 POOL="asia.rplant.xyz:17168"
